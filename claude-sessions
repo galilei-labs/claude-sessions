@@ -8,6 +8,8 @@ Green dot = live, grey dot = past (revivable with `claude --resume`).
 Usage:
   claude-sessions [QUERY...]        interactive picker (QUERY pre-fills the filter)
   claude-sessions -r | --resume     picker, then revive the chosen session in its cwd
+  claude-sessions -R                same, with --dangerously-skip-permissions
+  claude-sessions -r -- FLAGS...    extra FLAGS are passed through to claude
   claude-sessions -l | --list       plain table, no interaction
   claude-sessions --live            only sessions that are currently running
   claude-sessions --json            sessions as JSON
@@ -442,9 +444,12 @@ def _pending(fd):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main(argv):
-    args, words, limit = [], [], None
+    args, words, limit, extra = [], [], None, []
     it = iter(argv)
     for a in it:
+        if a == "--":
+            extra = list(it)
+            break
         if a == "-n":
             limit = int(next(it, "0"))
         elif a.startswith("-n") and a[2:].isdigit():
@@ -457,6 +462,10 @@ def main(argv):
     if "-h" in args or "--help" in args:
         print(__doc__.strip())
         return 0
+
+    want_resume = bool({"-r", "--resume", "-R", "--resume-skip-permissions"} & set(args))
+    if "-R" in args or "--resume-skip-permissions" in args:
+        extra = ["--dangerously-skip-permissions"] + extra
 
     sessions = load_sessions(live_only="--live" in args, limit=limit)
     color = sys.stderr.isatty() and "--no-color" not in args
@@ -471,12 +480,12 @@ def main(argv):
     interactive = sys.stdin.isatty() and sys.stderr.isatty() and not ("-l" in args or "--list" in args)
     if not interactive:
         matches = filter_sessions(sessions, query)
-        if "--cwd" in args or "--name" in args or "-r" in args or "--resume" in args:
+        if "--cwd" in args or "--name" in args or want_resume:
             if not matches:
                 return 1
             d = matches[0]
-            if "-r" in args or "--resume" in args:
-                return resume(d)
+            if want_resume:
+                return resume(d, extra)
             print(d.get("cwd") if "--cwd" in args else d.get("name"))
             return 0
         print_table(matches, color and sys.stdout.isatty())
@@ -485,8 +494,8 @@ def main(argv):
     chosen = pick(sessions, query)
     if chosen is None:
         return 130
-    if "-r" in args or "--resume" in args:
-        return resume(chosen)
+    if want_resume:
+        return resume(chosen, extra)
     if "--cwd" in args:
         print(chosen.get("cwd"))
     elif "--name" in args:
@@ -501,16 +510,17 @@ def main(argv):
     return 0
 
 
-def resume(d):
-    """Replace this process with `claude --resume <id>` run in the session's cwd."""
+def resume(d, extra=()):
+    """Replace this process with `claude --resume <id> [extra...]` in the session's cwd."""
     cwd = d.get("cwd")
     if cwd and os.path.isdir(cwd):
         os.chdir(cwd)
     else:
         print(f"warning: cwd {cwd!r} missing, resuming from here", file=sys.stderr)
-    print(f"{DIM}claude --resume {d.get('sessionId')}  ({short_cwd(cwd)}){RESET}", file=sys.stderr)
+    cmd = ["claude", "--resume", d.get("sessionId"), *extra]
+    print(f"{DIM}{' '.join(cmd)}  ({short_cwd(cwd)}){RESET}", file=sys.stderr)
     try:
-        os.execvp("claude", ["claude", "--resume", d.get("sessionId")])
+        os.execvp("claude", cmd)
     except OSError as e:
         print(f"failed to exec claude: {e}", file=sys.stderr)
         return 1

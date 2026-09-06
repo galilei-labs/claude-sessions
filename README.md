@@ -16,6 +16,8 @@ cached in `~/.cache/claude-sessions/` so repeat runs are instant.
 cs                      interactive picker
 cs corpo                picker with the filter pre-filled
 cs -r                   pick, then revive the session (claude --resume, in its cwd)
+cs -R                   same, adding --dangerously-skip-permissions
+cs -r -- --model opus   anything after -- is passed through to claude
 cs -l                   plain table (also used automatically when not on a TTY)
 cs --live               only sessions that are currently running
 cs -n 20                keep only the 20 most recent past sessions
