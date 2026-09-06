@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""claude-sessions: list live Claude Code sessions, with an interactive fuzzy picker.
+"""claude-sessions: list Claude Code sessions, live and past, with a fuzzy picker.
 
-Reads the registry Claude Code keeps in ~/.claude/sessions/<pid>.json and keeps
-only entries whose process is still alive.
+Live sessions come from the registry in ~/.claude/sessions/<pid>.json (kept only
+while the process is alive); past ones from the transcripts in ~/.claude/projects.
+Green dot = live, grey dot = past (revivable with `claude --resume`).
 
 Usage:
   claude-sessions [QUERY...]        interactive picker (QUERY pre-fills the filter)
+  claude-sessions -r | --resume     picker, then revive the chosen session in its cwd
   claude-sessions -l | --list       plain table, no interaction
-  claude-sessions --json            all live sessions as JSON
+  claude-sessions --live            only sessions that are currently running
+  claude-sessions --json            sessions as JSON
   claude-sessions --cwd  [QUERY]    print the chosen session's working directory
   claude-sessions --name [QUERY]    print the chosen session's name
+  claude-sessions -n N              keep only the N most recent past sessions
 
 On selection the session ID is printed to stdout (details go to stderr), so it
 composes:   cd "$(claude-sessions --cwd)"     claude --resume "$(claude-sessions)"
@@ -25,6 +29,8 @@ import time
 from pathlib import Path
 
 SESS_DIR = Path.home() / ".claude" / "sessions"
+PROJ_DIR = Path.home() / ".claude" / "projects"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-sessions" / "index.json"
 
 # ── ANSI helpers ─────────────────────────────────────────────────────────────
 ESC = "\x1b["
@@ -57,29 +63,148 @@ def alive(pid):
         return True
 
 
-def load_sessions(include_dead=False):
-    sessions = []
+def load_registry():
+    """Live sessions from ~/.claude/sessions, keyed by sessionId."""
+    live = {}
     if not SESS_DIR.is_dir():
-        return sessions
+        return live
     for f in SESS_DIR.glob("*.json"):
         try:
             d = json.loads(f.read_text())
         except Exception:
             continue
         pid = d.get("pid")
-        if not isinstance(pid, int):
+        if not isinstance(pid, int) or not alive(pid):
             continue
-        d["alive"] = alive(pid)
-        if d["alive"]:
-            # Guard against PID reuse: make sure the pid still belongs to claude.
-            comm = proc_comm(pid)
-            if comm is not None and "claude" not in os.path.basename(comm).lower() \
-                    and "node" not in os.path.basename(comm).lower():
-                d["alive"] = False
-        if d["alive"] or include_dead:
-            sessions.append(d)
-    sessions.sort(key=lambda d: d.get("updatedAt") or d.get("startedAt") or 0, reverse=True)
-    return sessions
+        # Guard against PID reuse: make sure the pid still belongs to claude.
+        comm = proc_comm(pid)
+        if comm is not None and "claude" not in os.path.basename(comm).lower() \
+                and "node" not in os.path.basename(comm).lower():
+            continue
+        d["alive"] = True
+        live[d.get("sessionId")] = d
+    return live
+
+
+def iso_ms(ts):
+    """'2026-09-04T11:33:52.649Z' -> epoch ms, or None."""
+    try:
+        from datetime import datetime, timezone
+        return int(datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+                   .replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def scan_transcript(path):
+    """Cheap single pass over a transcript: title, cwd, first/last time, prompts."""
+    info = {"sessionId": path.stem, "prompts": 0, "custom": None, "ai": None,
+            "cwd": None, "first": None, "last": None, "firstPrompt": None}
+    try:
+        with open(path, "rb") as fh:
+            for raw in fh:
+                if raw.startswith(b'{"type":"custom-title"'):
+                    try:
+                        info["custom"] = json.loads(raw).get("customTitle") or info["custom"]
+                    except Exception:
+                        pass
+                    continue
+                if raw.startswith(b'{"type":"ai-title"'):
+                    try:
+                        info["ai"] = json.loads(raw).get("aiTitle") or info["ai"]
+                    except Exception:
+                        pass
+                    continue
+                if b'"timestamp"' not in raw:
+                    continue
+                m = re.search(rb'"timestamp":"([^"]+)"', raw)
+                if m:
+                    info["last"] = m.group(1).decode()
+                    if info["first"] is None:
+                        info["first"] = info["last"]
+                if info["cwd"] is None:
+                    m = re.search(rb'"cwd":"([^"]+)"', raw)
+                    if m:
+                        info["cwd"] = m.group(1).decode()
+                if b'"type":"user"' in raw and b'"isMeta":true' not in raw \
+                        and b'"role":"user","content":"' in raw:
+                    info["prompts"] += 1
+                    if info["firstPrompt"] is None:
+                        try:
+                            c = json.loads(raw)["message"]["content"]
+                            if isinstance(c, str) and not c.startswith("<"):
+                                info["firstPrompt"] = " ".join(c.split())[:60]
+                        except Exception:
+                            pass
+    except OSError:
+        return None
+    return info
+
+
+def load_transcripts():
+    """Past (and live) sessions from ~/.claude/projects/*/<id>.jsonl."""
+    out = {}
+    if not PROJ_DIR.is_dir():
+        return out
+    try:
+        cache = json.loads(CACHE.read_text())
+    except Exception:
+        cache = {}
+    fresh, dirty = {}, False
+    for path in PROJ_DIR.glob("*/*.jsonl"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        key = str(path)
+        stamp = [st.st_size, int(st.st_mtime)]
+        hit = cache.get(key)
+        if hit and hit.get("stamp") == stamp:
+            info = hit["info"]
+        else:
+            info = scan_transcript(path)
+            dirty = True
+        fresh[key] = {"stamp": stamp, "info": info}
+        if not info or (info["prompts"] == 0 and not info["custom"]):
+            continue
+        out[info["sessionId"]] = info
+    if dirty or set(fresh) != set(cache):
+        try:
+            CACHE.parent.mkdir(parents=True, exist_ok=True)
+            CACHE.write_text(json.dumps(fresh))
+        except OSError:
+            pass
+    return out
+
+
+def load_sessions(live_only=False, limit=None):
+    live = load_registry()
+    past = {} if live_only else load_transcripts()
+    sessions = []
+    for sid, d in live.items():
+        t = past.get(sid)
+        if t:
+            d["aiTitle"] = t["ai"]
+            d["prompts"] = t["prompts"]
+        sessions.append(d)
+    dead = []
+    for sid, t in past.items():
+        if sid in live:
+            continue
+        name = t["custom"] or t["ai"] or t["firstPrompt"]
+        dead.append({
+            "sessionId": sid, "alive": False, "pid": None, "status": "past",
+            "cwd": t["cwd"], "name": name,
+            "nameSource": "user" if t["custom"] else ("ai" if t["ai"] else "prompt"),
+            "aiTitle": t["ai"], "prompts": t["prompts"],
+            "startedAt": iso_ms(t["first"] or ""), "updatedAt": iso_ms(t["last"] or ""),
+        })
+    key = lambda d: d.get("updatedAt") or d.get("startedAt") or 0
+    sessions.sort(key=key, reverse=True)
+    dead.sort(key=key, reverse=True)
+    if limit is not None:
+        dead = dead[:limit]
+    return sessions + dead
 
 
 def display_name(d):
@@ -87,6 +212,11 @@ def display_name(d):
     if d.get("nameSource") == "user" and d.get("name"):
         return d["name"], True
     return (d.get("sessionId") or "?")[:8], False
+
+
+def name_hint(d):
+    """Secondary label for unnamed sessions: derived name or AI title."""
+    return d.get("aiTitle") or d.get("name") or ""
 
 
 def short_cwd(p):
@@ -116,7 +246,7 @@ def haystack(d):
     subsequence matches meaningless.
     """
     fuzzy_src = " ".join(str(x) for x in (
-        d.get("name"), short_cwd(d.get("cwd")), d.get("status")) if x).lower()
+        d.get("name"), d.get("aiTitle"), short_cwd(d.get("cwd")), d.get("status")) if x).lower()
     text = fuzzy_src + " " + " ".join(str(x) for x in (d.get("sessionId"), d.get("pid")) if x).lower()
     tokens = [t for t in re.split(r"[^a-z0-9]+", fuzzy_src) if t]
     return text, tokens
@@ -176,7 +306,7 @@ def filter_sessions(sessions, query):
 def status_dot(d):
     st = d.get("status") or "?"
     if not d.get("alive"):
-        return RED + "○" + RESET, "dead"
+        return DIM + "○" + RESET, "past"
     color = {"idle": GREEN, "busy": YELLOW}.get(st, CYAN)
     return color + "●" + RESET, st
 
@@ -184,11 +314,19 @@ def status_dot(d):
 def row(d, width, selected=False, color=True):
     dot, st = status_dot(d)
     name, is_user = display_name(d)
-    name_col = (BOLD + name + RESET) if is_user else (name + DIM + f"  ({d.get('name')})" + RESET)
-    plain_name = name if is_user else f"{name}  ({d.get('name')})"
-    pad = max(0, 28 - len(plain_name))
+    hint = name_hint(d)
+    if not is_user and hint:
+        room = 40 - len(name) - 4
+        hint = hint if len(hint) <= room else hint[:room - 1] + "…"
+        name_col = name + DIM + f"  ({hint})" + RESET
+        plain_name = f"{name}  ({hint})"
+    else:
+        name_col = (BOLD + name + RESET) if is_user else name
+        plain_name = name
+    pad = max(0, 40 - len(plain_name))
     cwd = short_cwd(d.get("cwd"))
-    right = f"{ago(d.get('updatedAt') or d.get('startedAt')):>4}  {st:<4} {d.get('pid'):>6}"
+    pid = d.get("pid") or ""
+    right = f"{ago(d.get('updatedAt') or d.get('startedAt')):>4}  {st:<4} {pid:>6}"
     # Trim cwd so the line fits the terminal.
     used = 2 + len(plain_name) + pad + 2 + len(right) + 2
     room = max(8, width - used)
@@ -304,29 +442,41 @@ def _pending(fd):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main(argv):
-    args = [a for a in argv if a.startswith("-")]
-    query = " ".join(a for a in argv if not a.startswith("-"))
+    args, words, limit = [], [], None
+    it = iter(argv)
+    for a in it:
+        if a == "-n":
+            limit = int(next(it, "0"))
+        elif a.startswith("-n") and a[2:].isdigit():
+            limit = int(a[2:])
+        elif a.startswith("-"):
+            args.append(a)
+        else:
+            words.append(a)
+    query = " ".join(words)
     if "-h" in args or "--help" in args:
         print(__doc__.strip())
         return 0
 
-    sessions = load_sessions(include_dead="--all" in args)
+    sessions = load_sessions(live_only="--live" in args, limit=limit)
     color = sys.stderr.isatty() and "--no-color" not in args
 
     if "--json" in args:
         print(json.dumps(filter_sessions(sessions, query), indent=2))
         return 0
     if not sessions:
-        print("no live Claude Code sessions", file=sys.stderr)
+        print("no Claude Code sessions found", file=sys.stderr)
         return 1
 
     interactive = sys.stdin.isatty() and sys.stderr.isatty() and not ("-l" in args or "--list" in args)
     if not interactive:
         matches = filter_sessions(sessions, query)
-        if "--cwd" in args or "--name" in args:
+        if "--cwd" in args or "--name" in args or "-r" in args or "--resume" in args:
             if not matches:
                 return 1
             d = matches[0]
+            if "-r" in args or "--resume" in args:
+                return resume(d)
             print(d.get("cwd") if "--cwd" in args else d.get("name"))
             return 0
         print_table(matches, color and sys.stdout.isatty())
@@ -335,17 +485,35 @@ def main(argv):
     chosen = pick(sessions, query)
     if chosen is None:
         return 130
-    name, _ = display_name(chosen)
+    if "-r" in args or "--resume" in args:
+        return resume(chosen)
     if "--cwd" in args:
         print(chosen.get("cwd"))
     elif "--name" in args:
         print(chosen.get("name"))
     else:
         dot, st = status_dot(chosen)
+        tail = f"pid {chosen.get('pid')}  {st}" if chosen.get("alive") else \
+            f"{st}  revive: claude --resume {chosen.get('sessionId')}"
         print(f"{dot} {BOLD}{chosen.get('name')}{RESET}  {DIM}{short_cwd(chosen.get('cwd'))}  "
-              f"pid {chosen.get('pid')}  {st}{RESET}", file=sys.stderr)
+              f"{tail}{RESET}", file=sys.stderr)
         print(chosen.get("sessionId"))
     return 0
+
+
+def resume(d):
+    """Replace this process with `claude --resume <id>` run in the session's cwd."""
+    cwd = d.get("cwd")
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+    else:
+        print(f"warning: cwd {cwd!r} missing, resuming from here", file=sys.stderr)
+    print(f"{DIM}claude --resume {d.get('sessionId')}  ({short_cwd(cwd)}){RESET}", file=sys.stderr)
+    try:
+        os.execvp("claude", ["claude", "--resume", d.get("sessionId")])
+    except OSError as e:
+        print(f"failed to exec claude: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
