@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""claude-sessions: list live Claude Code sessions, with an interactive fuzzy picker.
+
+Reads the registry Claude Code keeps in ~/.claude/sessions/<pid>.json and keeps
+only entries whose process is still alive.
+
+Usage:
+  claude-sessions [QUERY...]        interactive picker (QUERY pre-fills the filter)
+  claude-sessions -l | --list       plain table, no interaction
+  claude-sessions --json            all live sessions as JSON
+  claude-sessions --cwd  [QUERY]    print the chosen session's working directory
+  claude-sessions --name [QUERY]    print the chosen session's name
+
+On selection the session ID is printed to stdout (details go to stderr), so it
+composes:   cd "$(claude-sessions --cwd)"     claude --resume "$(claude-sessions)"
+
+Keys: type to filter · ↑/↓ or ^P/^N move · Enter select · Esc/^C quit
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SESS_DIR = Path.home() / ".claude" / "sessions"
+
+# ── ANSI helpers ─────────────────────────────────────────────────────────────
+ESC = "\x1b["
+RESET, BOLD, DIM = ESC + "0m", ESC + "1m", ESC + "2m"
+GREEN, YELLOW, RED, CYAN, MAGENTA = (ESC + c for c in ("32m", "33m", "31m", "36m", "35m"))
+REV = ESC + "7m"
+
+
+def strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+def proc_comm(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def load_sessions(include_dead=False):
+    sessions = []
+    if not SESS_DIR.is_dir():
+        return sessions
+    for f in SESS_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        pid = d.get("pid")
+        if not isinstance(pid, int):
+            continue
+        d["alive"] = alive(pid)
+        if d["alive"]:
+            # Guard against PID reuse: make sure the pid still belongs to claude.
+            comm = proc_comm(pid)
+            if comm is not None and "claude" not in os.path.basename(comm).lower() \
+                    and "node" not in os.path.basename(comm).lower():
+                d["alive"] = False
+        if d["alive"] or include_dead:
+            sessions.append(d)
+    sessions.sort(key=lambda d: d.get("updatedAt") or d.get("startedAt") or 0, reverse=True)
+    return sessions
+
+
+def display_name(d):
+    """User-set name, else the session ID (with the derived name as a hint)."""
+    if d.get("nameSource") == "user" and d.get("name"):
+        return d["name"], True
+    return (d.get("sessionId") or "?")[:8], False
+
+
+def short_cwd(p):
+    home = str(Path.home())
+    if p and p.startswith(home):
+        p = "~" + p[len(home):]
+    return p or ""
+
+
+def ago(ms):
+    if not ms:
+        return ""
+    s = int(time.time() - ms / 1000)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def haystack(d):
+    """(text for substring matching, tokens for per-token fuzzy matching).
+
+    Session IDs and pids only take part in substring matching: hex soup makes
+    subsequence matches meaningless.
+    """
+    fuzzy_src = " ".join(str(x) for x in (
+        d.get("name"), short_cwd(d.get("cwd")), d.get("status")) if x).lower()
+    text = fuzzy_src + " " + " ".join(str(x) for x in (d.get("sessionId"), d.get("pid")) if x).lower()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", fuzzy_src) if t]
+    return text, tokens
+
+
+def subseq_spread(word, token):
+    """Length of the shortest-first subsequence window of word in token, or None."""
+    i, first, last = 0, -1, -1
+    for j, ch in enumerate(token):
+        if ch == word[i]:
+            if first < 0:
+                first = j
+            last = j
+            i += 1
+            if i == len(word):
+                return last - first
+    return None
+
+
+def fuzzy(word, text, tokens):
+    """Score a query word against a haystack (lower is better), or None.
+
+    A contiguous substring anywhere wins; otherwise the word must be a
+    subsequence of a single token (so "crp" hits "corpo" but "corpo" does not
+    hit "kattis-contract ... projects").
+    """
+    if word in text:
+        return text.index(word)
+    best = None
+    for tok in tokens:
+        sp = subseq_spread(word, tok)
+        if sp is not None and (best is None or sp < best):
+            best = sp
+    return None if best is None else 1000 + best
+
+
+def filter_sessions(sessions, query):
+    words = query.lower().split()
+    if not words:
+        return list(sessions)
+    scored = []
+    for d in sessions:
+        text, tokens = haystack(d)
+        total = 0
+        for w in words:
+            s = fuzzy(w, text, tokens)
+            if s is None:
+                break
+            total += s
+        else:
+            scored.append((total, d))
+    scored.sort(key=lambda t: t[0])
+    return [d for _, d in scored]
+
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+def status_dot(d):
+    st = d.get("status") or "?"
+    if not d.get("alive"):
+        return RED + "○" + RESET, "dead"
+    color = {"idle": GREEN, "busy": YELLOW}.get(st, CYAN)
+    return color + "●" + RESET, st
+
+
+def row(d, width, selected=False, color=True):
+    dot, st = status_dot(d)
+    name, is_user = display_name(d)
+    name_col = (BOLD + name + RESET) if is_user else (name + DIM + f"  ({d.get('name')})" + RESET)
+    plain_name = name if is_user else f"{name}  ({d.get('name')})"
+    pad = max(0, 28 - len(plain_name))
+    cwd = short_cwd(d.get("cwd"))
+    right = f"{ago(d.get('updatedAt') or d.get('startedAt')):>4}  {st:<4} {d.get('pid'):>6}"
+    # Trim cwd so the line fits the terminal.
+    used = 2 + len(plain_name) + pad + 2 + len(right) + 2
+    room = max(8, width - used)
+    if len(cwd) > room:
+        cwd = "…" + cwd[-(room - 1):]
+    cwd_pad = max(0, room - len(cwd))
+    line = f"{dot} {name_col}{' ' * pad}  {DIM}{cwd}{RESET}{' ' * cwd_pad}  {right}"
+    if not color:
+        line = strip_ansi(line)
+    if selected:
+        line = REV + strip_ansi(line) + RESET
+    return line
+
+
+def term_size():
+    try:
+        sz = os.get_terminal_size(sys.stderr.fileno())
+        if sz.columns > 0 and sz.lines > 0:
+            return sz.columns, sz.lines
+        return 100, 24
+    except OSError:
+        return 100, 24
+
+
+def print_table(sessions, color):
+    width, _ = term_size()
+    for d in sessions:
+        print(row(d, width, color=color))
+
+
+# ── Interactive picker ───────────────────────────────────────────────────────
+def pick(sessions, query=""):
+    import termios
+    import tty
+
+    err = sys.stderr
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    sel = 0
+    drawn = 0
+
+    def draw():
+        nonlocal drawn, sel
+        width, height = term_size()
+        matches = filter_sessions(sessions, query)
+        sel = max(0, min(sel, len(matches) - 1))
+        max_rows = max(1, height - 3)
+        top = max(0, min(sel - max_rows + 1, len(matches) - max_rows)) if len(matches) > max_rows else 0
+        visible = matches[top:top + max_rows]
+        # Move to top of previously drawn block and clear it.
+        out = ("\r" + ESC + f"{drawn}A" if drawn else "\r") + ESC + "J"
+        out += f"{CYAN}❯{RESET} {query}{DIM}▏{RESET}  {DIM}{len(matches)}/{len(sessions)}{RESET}\r\n"
+        for i, d in enumerate(visible):
+            out += row(d, width, selected=(top + i == sel)) + "\r\n"
+        if not matches:
+            out += f"{DIM}  no match{RESET}\r\n"
+        drawn = 1 + max(1, len(visible))
+        err.write(out)
+        err.flush()
+        return matches
+
+    try:
+        tty.setraw(fd)
+        err.write(ESC + "?25l")  # hide cursor
+        matches = draw()
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\x1b":  # escape or arrow sequence
+                seq = os.read(fd, 2) if _pending(fd) else b""
+                if seq == b"[A":
+                    sel -= 1
+                elif seq == b"[B":
+                    sel += 1
+                elif seq == b"":
+                    return None
+            elif ch in (b"\x03", b"\x04"):  # ^C ^D
+                return None
+            elif ch in (b"\r", b"\n"):
+                return matches[sel] if matches else None
+            elif ch in (b"\x7f", b"\x08"):
+                query = query[:-1]
+            elif ch == b"\x15":  # ^U
+                query = ""
+            elif ch == b"\x17":  # ^W
+                query = query.rstrip()
+                query = query[:query.rfind(" ") + 1] if " " in query else ""
+            elif ch == b"\x10":  # ^P
+                sel -= 1
+            elif ch == b"\x0e":  # ^N
+                sel += 1
+            elif ch == b"\t":
+                sel += 1
+            elif ch >= b" ":
+                try:
+                    query += ch.decode()
+                except UnicodeDecodeError:
+                    pass
+            if sel < 0:
+                sel = max(0, len(matches) - 1)
+            matches = draw()
+    finally:
+        err.write(ESC + "?25h")
+        err.write("\r" + ESC + f"{drawn}A" + ESC + "J" if drawn else "")
+        err.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _pending(fd):
+    import select
+    r, _, _ = select.select([fd], [], [], 0.02)
+    return bool(r)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main(argv):
+    args = [a for a in argv if a.startswith("-")]
+    query = " ".join(a for a in argv if not a.startswith("-"))
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return 0
+
+    sessions = load_sessions(include_dead="--all" in args)
+    color = sys.stderr.isatty() and "--no-color" not in args
+
+    if "--json" in args:
+        print(json.dumps(filter_sessions(sessions, query), indent=2))
+        return 0
+    if not sessions:
+        print("no live Claude Code sessions", file=sys.stderr)
+        return 1
+
+    interactive = sys.stdin.isatty() and sys.stderr.isatty() and not ("-l" in args or "--list" in args)
+    if not interactive:
+        matches = filter_sessions(sessions, query)
+        if "--cwd" in args or "--name" in args:
+            if not matches:
+                return 1
+            d = matches[0]
+            print(d.get("cwd") if "--cwd" in args else d.get("name"))
+            return 0
+        print_table(matches, color and sys.stdout.isatty())
+        return 0
+
+    chosen = pick(sessions, query)
+    if chosen is None:
+        return 130
+    name, _ = display_name(chosen)
+    if "--cwd" in args:
+        print(chosen.get("cwd"))
+    elif "--name" in args:
+        print(chosen.get("name"))
+    else:
+        dot, st = status_dot(chosen)
+        print(f"{dot} {BOLD}{chosen.get('name')}{RESET}  {DIM}{short_cwd(chosen.get('cwd'))}  "
+              f"pid {chosen.get('pid')}  {st}{RESET}", file=sys.stderr)
+        print(chosen.get("sessionId"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
