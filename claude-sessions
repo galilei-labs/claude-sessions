@@ -599,11 +599,12 @@ def main(argv):
     chosen = pick(sessions, query)
     if chosen is None:
         return 130
-    if want_resume and chosen.get("alive"):
-        # A live session cannot be resumed a second time; go to its window instead.
-        want_focus = True
     if want_resume:
-        return resume(chosen, extra)
+        if not chosen.get("alive"):
+            return resume(chosen, extra)
+        # A live session cannot be resumed a second time; go to its window instead.
+        print(f"{DIM}{chosen.get('name')} is already running, focusing its window{RESET}", file=sys.stderr)
+        return 0 if focus(chosen) else 1
     if want_focus and chosen.get("alive"):
         focus(chosen)
     if "--cwd" in args:
