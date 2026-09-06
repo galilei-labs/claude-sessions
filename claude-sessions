@@ -17,7 +17,11 @@ Usage:
   claude-sessions --name [QUERY]    print the chosen session's name
   claude-sessions -n N              keep only the N most recent past sessions
 
-On selection the session ID is printed to stdout (details go to stderr), so it
+  claude-sessions -f | --focus      bring the chosen live session's terminal tab to front
+  claude-sessions --no-focus        never focus (default when stdout is not a TTY)
+
+Enter on a live session focuses its Terminal.app / iTerm2 tab (when stdout is a
+TTY). The session ID is always printed to stdout (details go to stderr), so it
 composes:   cd "$(claude-sessions --cwd)"     claude --resume "$(claude-sessions)"
 
 Keys: type to filter · ↑/↓ or ^P/^N move · Enter select · Esc/^C quit
@@ -442,6 +446,101 @@ def _pending(fd):
     return bool(r)
 
 
+# ── Focus the terminal tab of a live session ─────────────────────────────────
+def ps_field(pid, field):
+    try:
+        return subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=2).stdout.strip()
+    except Exception:
+        return ""
+
+
+def terminal_app(pid):
+    """Walk up the parent chain and name the terminal emulator, if recognised."""
+    known = {"terminal": "Terminal", "iterm2": "iTerm2", "iterm": "iTerm2",
+             "ghostty": "Ghostty", "kitty": "kitty", "wezterm-gui": "WezTerm",
+             "alacritty": "Alacritty", "warp": "Warp", "code": "VS Code", "cursor": "Cursor"}
+    for _ in range(20):
+        comm = os.path.basename(ps_field(pid, "comm")).lower()
+        for k, v in known.items():
+            if comm == k or comm.startswith(k + "."):
+                return v
+        ppid = ps_field(pid, "ppid")
+        if not ppid.isdigit() or int(ppid) <= 1:
+            break
+        pid = int(ppid)
+    return None
+
+
+OSA_TERMINAL = '''
+on run argv
+  set target to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (tty of t) is target then
+          set selected tab of w to t
+          set index of w to 1
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+'''
+
+OSA_ITERM = '''
+on run argv
+  set target to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is target then
+            select t
+            select w
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+'''
+
+
+def focus(d):
+    """Bring the terminal tab hosting live session d to the front. Returns True on success."""
+    pid = d.get("pid")
+    if not pid:
+        return False
+    tty = ps_field(pid, "tty")
+    if not tty or tty == "??":
+        print("focus: session has no tty", file=sys.stderr)
+        return False
+    dev = tty if tty.startswith("/dev/") else "/dev/" + tty
+    app = terminal_app(pid)
+    script = {"Terminal": OSA_TERMINAL, "iTerm2": OSA_ITERM}.get(app)
+    if script is None:
+        print(f"focus: don't know how to focus {app or 'this terminal'} (tty {dev})", file=sys.stderr)
+        return False
+    try:
+        r = subprocess.run(["osascript", "-", dev], input=script, capture_output=True,
+                           text=True, timeout=10)
+    except Exception as e:
+        print(f"focus: osascript failed: {e}", file=sys.stderr)
+        return False
+    if r.returncode != 0 or r.stdout.strip() != "ok":
+        msg = r.stderr.strip() or r.stdout.strip() or "tab not found"
+        print(f"focus: {app}: {msg}", file=sys.stderr)
+        return False
+    return True
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main(argv):
     args, words, limit, extra = [], [], None, []
@@ -464,6 +563,7 @@ def main(argv):
         return 0
 
     want_resume = bool({"-r", "--resume", "-R", "--resume-skip-permissions"} & set(args))
+    want_focus = ("-f" in args or "--focus" in args) or (sys.stdout.isatty() and "--no-focus" not in args)
     if "-R" in args or "--resume-skip-permissions" in args:
         extra = ["--dangerously-skip-permissions"] + extra
 
@@ -480,12 +580,17 @@ def main(argv):
     interactive = sys.stdin.isatty() and sys.stderr.isatty() and not ("-l" in args or "--list" in args)
     if not interactive:
         matches = filter_sessions(sessions, query)
-        if "--cwd" in args or "--name" in args or want_resume:
+        if "--cwd" in args or "--name" in args or want_resume or "-f" in args or "--focus" in args:
             if not matches:
                 return 1
             d = matches[0]
-            if want_resume:
+            if want_resume and not d.get("alive"):
                 return resume(d, extra)
+            if want_resume or "-f" in args or "--focus" in args:
+                if not d.get("alive"):
+                    print(f"{d.get('name')} is not running (resume with -r)", file=sys.stderr)
+                    return 1
+                return 0 if focus(d) else 1
             print(d.get("cwd") if "--cwd" in args else d.get("name"))
             return 0
         print_table(matches, color and sys.stdout.isatty())
@@ -494,8 +599,13 @@ def main(argv):
     chosen = pick(sessions, query)
     if chosen is None:
         return 130
+    if want_resume and chosen.get("alive"):
+        # A live session cannot be resumed a second time; go to its window instead.
+        want_focus = True
     if want_resume:
         return resume(chosen, extra)
+    if want_focus and chosen.get("alive"):
+        focus(chosen)
     if "--cwd" in args:
         print(chosen.get("cwd"))
     elif "--name" in args:

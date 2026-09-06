@@ -18,6 +18,8 @@ cs corpo                picker with the filter pre-filled
 cs -r                   pick, then revive the session (claude --resume, in its cwd)
 cs -R                   same, adding --dangerously-skip-permissions
 cs -r -- --model opus   anything after -- is passed through to claude
+cs -f                   pick, then bring the live session's terminal tab to front
+cs --no-focus           do not focus on Enter
 cs -l                   plain table (also used automatically when not on a TTY)
 cs --live               only sessions that are currently running
 cs -n 20                keep only the 20 most recent past sessions
@@ -35,8 +37,13 @@ Matching: each space-separated word must hit. A word matches as a contiguous
 substring of the name, AI title, path, status, session ID or pid, or as a
 subsequence of a single word of the name, title or path (`crp` finds `corpo`).
 
-On selection the session ID goes to stdout and a summary to stderr, so it
-composes with other commands:
+Enter on a **live** session brings its Terminal.app or iTerm2 tab to the
+front (found by matching the session's tty; skipped when stdout is not a TTY
+so command substitution stays quiet, forced with `-f`). `-r`/`-R` on a live
+session also just focuses it, since a running session cannot be resumed twice.
+
+The session ID always goes to stdout and a summary to stderr, so it composes
+with other commands:
 
 ```sh
 cd "$(cs --cwd)"
