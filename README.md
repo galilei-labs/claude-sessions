@@ -3,12 +3,8 @@
 A tiny CLI for [Claude Code](https://claude.com/claude-code) that lists your
 sessions, live and past, and lets you jump to one by typing a few letters.
 
-```
-❯ api▏  3/52
-● api-refactor                           ~/code/backend                       2m  busy  48213
-● 3061de6d  (Add rate limiting to API)    ~/code/backend                       1d  idle  60896
-○ api-docs                               ~/code/docs                          3d  past
-```
+![claude-sessions picker](docs/screenshot.png)
+
 
 `●` green: running (yellow while busy). `○` grey: past session, revivable.
 Bold names are ones you set with `/rename`; otherwise the session ID is shown
