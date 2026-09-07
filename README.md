@@ -4,10 +4,10 @@ A tiny CLI for [Claude Code](https://claude.com/claude-code) that lists your
 sessions, live and past, and lets you jump to one by typing a few letters.
 
 ```
-❯ corp▏  3/52
-● ariel-tax                              ~/Documents/projects/galilei/corpo   1d  idle    112
-● 3061de6d  (Documents cabinet comptable) ~/Documents/projects/galilei/corpo   1d  idle  60896
-○ oak-msb-compliance                     ~/Documents/projects/galilei/corpo   3d  past
+❯ api▏  3/52
+● api-refactor                           ~/code/backend                       2m  busy  48213
+● 3061de6d  (Add rate limiting to API)    ~/code/backend                       1d  idle  60896
+○ api-docs                               ~/code/docs                          3d  past
 ```
 
 `●` green: running (yellow while busy). `○` grey: past session, revivable.
@@ -30,7 +30,7 @@ Make sure `~/.local/bin` is on your `PATH`. Use any name you like for the link.
 
 ```
 cs                  interactive picker
-cs corpo            picker with the filter pre-filled
+cs api              picker with the filter pre-filled
 cs -r               pick a past session and revive it (claude --resume, in its cwd)
 cs -R               same, adding --dangerously-skip-permissions
 cs -r -- FLAGS...   anything after -- is passed through to claude
@@ -43,7 +43,7 @@ cs --json [QUERY]   sessions as JSON
 
 In the picker: type to filter, `↑`/`↓` to move, `Enter` to select, `Esc` to
 quit. Every word you type must match, as a substring of the name, title, path
-or ID, or as a subsequence of one word (`crp` finds `corpo`).
+or ID, or as a subsequence of one word (`rfct` finds `refactor`).
 
 **Enter on a live session** brings its Terminal.app or iTerm2 tab to the
 front. **Enter on a past session** prints its ID, so it composes:
